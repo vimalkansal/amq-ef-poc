@@ -3,6 +3,25 @@ provider "aws" {
   region = "ap-southeast-2"
 }
 
+# Random string for S3 bucket name
+resource "random_string" "bucket_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+# S3 bucket for temporary file storage
+resource "aws_s3_bucket" "temp_storage" {
+  bucket = "amq-temp-storage-${random_string.bucket_suffix.result}"
+}
+
+# Upload AMQ broker zip to S3
+resource "aws_s3_object" "amq_broker_zip" {
+  bucket = aws_s3_bucket.temp_storage.id
+  key    = "amq-broker-7.12.0-bin.zip"
+  source = "./amq-broker-7.12.0-bin.zip"  # Ensure this file is in your current directory
+}
+
 # VPC configuration
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -151,9 +170,9 @@ resource "aws_iam_role" "ec2_efs_role" {
   })
 }
 
-# IAM Policy for EFS access
-resource "aws_iam_role_policy" "efs_policy" {
-  name = "efs_policy"
+# IAM Policy for EFS and S3 access
+resource "aws_iam_role_policy" "ec2_policy" {
+  name = "ec2_policy"
   role = aws_iam_role.ec2_efs_role.id
 
   policy = jsonencode({
@@ -167,6 +186,13 @@ resource "aws_iam_role_policy" "efs_policy" {
           "elasticfilesystem:DescribeFileSystems"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = "${aws_s3_bucket.temp_storage.arn}/*"
       }
     ]
   })
@@ -197,15 +223,32 @@ resource "aws_instance" "amq_node" {
               # Update the system
               echo "Updating system packages"
               sudo yum update -y
+              if [ $? -ne 0 ]; then
+                echo "Failed to update system packages"
+                exit 1
+              fi
               
               # Install Amazon EFS utilities
               echo "Installing Amazon EFS utilities"
               sudo yum install -y amazon-efs-utils
+              if [ $? -ne 0 ]; then
+                echo "Failed to install Amazon EFS utilities"
+                exit 1
+              fi
+              
+              # Install AWS CLI
+              echo "Installing AWS CLI"
+              sudo yum install -y awscli
+              if [ $? -ne 0 ]; then
+                echo "Failed to install AWS CLI"
+                exit 1
+              fi
               
               # Install OpenJDK 17
               echo "Installing OpenJDK 17"
               sudo amazon-linux-extras enable java-openjdk17
-              if ! sudo yum install -y java-17-openjdk; then
+              sudo yum install -y java-17-openjdk
+              if [ $? -ne 0 ]; then
                 echo "Failed to install Java 17 using amazon-linux-extras. Attempting manual installation."
                 sudo yum install -y wget
                 wget https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_linux-x64_bin.tar.gz
@@ -230,10 +273,25 @@ resource "aws_instance" "amq_node" {
               # Mount EFS
               echo "Mounting EFS"
               sudo mkdir -p /mnt/efs
-              echo "${aws_efs_file_system.amq_efs.dns_name}:/ /mnt/efs efs _netdev,tls,iam,accesspoint=${aws_efs_access_point.amq_efs_ap.id} 0 0" | sudo tee -a /etc/fstab
-              sudo mount -a
+              sudo mount -t efs -o tls,accesspoint=${aws_efs_access_point.amq_efs_ap.id} ${aws_efs_file_system.amq_efs.dns_name}:/ /mnt/efs
+              if [ $? -ne 0 ]; then
+                echo "Failed to mount EFS"
+                exit 1
+              fi
+              echo "${aws_efs_file_system.amq_efs.dns_name}:/ /mnt/efs efs _netdev,tls,accesspoint=${aws_efs_access_point.amq_efs_ap.id} 0 0" | sudo tee -a /etc/fstab
               
-              echo "User data script completed"
+              # Create directory for AMQ broker
+              sudo mkdir -p /mnt/efs/amq-broker
+              
+              # Download AMQ broker zip from S3 to EFS
+              echo "Downloading AMQ broker zip from S3 to EFS"
+              aws s3 cp s3://${aws_s3_bucket.temp_storage.id}/${aws_s3_object.amq_broker_zip.key} /mnt/efs/amq-broker/
+              if [ $? -ne 0 ]; then
+                echo "Failed to download AMQ broker zip from S3"
+                exit 1
+              fi
+              
+              echo "User data script completed successfully"
               EOF
   )
 
@@ -241,7 +299,7 @@ resource "aws_instance" "amq_node" {
     Name = "amq-node-${count.index + 1}"
   }
 
-  depends_on = [aws_efs_mount_target.amq_efs_mount]
+  depends_on = [aws_efs_mount_target.amq_efs_mount, aws_s3_object.amq_broker_zip]
 
   lifecycle {
     create_before_destroy = true
