@@ -181,7 +181,7 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 # EC2 instances
 resource "aws_instance" "amq_node" {
   count                       = 2
-  ami                         = "ami-02346a771f34de8ac"  # Amazon Linux 2 AMI for ap-southeast-2
+  ami                         = "ami-0d6294dcaac5546e4"  # Amazon Linux 2 AMI (HVM) - Kernel 5.10, SSD Volume Type
   instance_type               = "t3.medium"
   key_name                    = "amq_key_pair"
   vpc_security_group_ids      = [aws_security_group.allow_amq.id]
@@ -189,20 +189,63 @@ resource "aws_instance" "amq_node" {
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.ec2_profile.name
 
-  user_data = <<-EOF
+  user_data = base64encode(<<-EOF
               #!/bin/bash
-              yum update -y
-              yum install -y amazon-efs-utils
-              mkdir -p /mnt/efs
-              echo "${aws_efs_file_system.amq_efs.dns_name}:/ /mnt/efs efs _netdev,tls,iam,accesspoint=${aws_efs_access_point.amq_efs_ap.id} 0 0" >> /etc/fstab
-              mount -a
+              exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+              echo "Starting user data script execution"
+              
+              # Update the system
+              echo "Updating system packages"
+              sudo yum update -y
+              
+              # Install Amazon EFS utilities
+              echo "Installing Amazon EFS utilities"
+              sudo yum install -y amazon-efs-utils
+              
+              # Install OpenJDK 17
+              echo "Installing OpenJDK 17"
+              sudo amazon-linux-extras enable java-openjdk17
+              if ! sudo yum install -y java-17-openjdk; then
+                echo "Failed to install Java 17 using amazon-linux-extras. Attempting manual installation."
+                sudo yum install -y wget
+                wget https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_linux-x64_bin.tar.gz
+                sudo tar xvf openjdk-17.0.2_linux-x64_bin.tar.gz -C /opt/
+                sudo mv /opt/jdk-17.0.2 /opt/jdk-17
+                echo "export JAVA_HOME=/opt/jdk-17" | sudo tee -a /etc/profile
+                echo "export PATH=\$PATH:\$JAVA_HOME/bin" | sudo tee -a /etc/profile
+              else
+                echo "export JAVA_HOME=/usr/lib/jvm/jre-17-openjdk" | sudo tee -a /etc/profile
+                echo "export PATH=\$PATH:\$JAVA_HOME/bin" | sudo tee -a /etc/profile
+              fi
+              
+              # Verify Java installation
+              echo "Verifying Java installation"
+              source /etc/profile
+              java -version
+              if [ $? -ne 0 ]; then
+                echo "Java installation verification failed"
+                exit 1
+              fi
+              
+              # Mount EFS
+              echo "Mounting EFS"
+              sudo mkdir -p /mnt/efs
+              echo "${aws_efs_file_system.amq_efs.dns_name}:/ /mnt/efs efs _netdev,tls,iam,accesspoint=${aws_efs_access_point.amq_efs_ap.id} 0 0" | sudo tee -a /etc/fstab
+              sudo mount -a
+              
+              echo "User data script completed"
               EOF
+  )
 
   tags = {
     Name = "amq-node-${count.index + 1}"
   }
 
   depends_on = [aws_efs_mount_target.amq_efs_mount]
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Outputs
